@@ -2,7 +2,7 @@
 //! single-pixel pen paths (Zhang-Suen), trace them into ordered strokes, and
 //! yield them for stroke-by-stroke animation.
 
-use ab_glyph::{Font, FontRef, Glyph, PxScale, ScaleFont};
+use ab_glyph::{Font, FontRef, Glyph, GlyphId, PxScale, ScaleFont};
 
 pub struct Line {
     pub width: usize,
@@ -11,28 +11,83 @@ pub struct Line {
     pub mask: Vec<bool>,
 }
 
+pub struct FontStack<'font> {
+    fonts: Vec<FontRef<'font>>,
+}
+
+impl<'font> FontStack<'font> {
+    pub fn single(font: FontRef<'font>) -> Self {
+        Self { fonts: vec![font] }
+    }
+
+    pub fn with_fallbacks(primary: FontRef<'font>, fallbacks: impl IntoIterator<Item = FontRef<'font>>) -> Self {
+        let mut fonts = vec![primary];
+        fonts.extend(fallbacks);
+        Self { fonts }
+    }
+
+    fn glyph_for(&self, c: char) -> Option<(usize, GlyphId)> {
+        for (i, font) in self.fonts.iter().enumerate() {
+            let id = font.glyph_id(c);
+            if id.0 != 0 {
+                return Some((i, id));
+            }
+        }
+        None
+    }
+
+    fn vertical_metrics(&self, px: f32) -> (f32, f32) {
+        let mut ascent = 0.0f32;
+        let mut descent = 0.0f32;
+        for font in &self.fonts {
+            let scaled = font.as_scaled(PxScale::from(px));
+            ascent = ascent.max(scaled.ascent());
+            descent = descent.min(scaled.descent());
+        }
+        (ascent, ascent - descent)
+    }
+}
+
 /// Rasterize one line of text at `px` height into a boolean mask.
 pub fn rasterize_line(font: &FontRef, text: &str, px: f32) -> Line {
-    let scaled = font.as_scaled(PxScale::from(px));
-    let mut glyphs: Vec<Glyph> = Vec::new();
+    rasterize_line_stack(&FontStack::single(font.clone()), text, px)
+}
+
+/// Rasterize one line with per-character font fallback.
+pub fn rasterize_line_stack(fonts: &FontStack, text: &str, px: f32) -> Line {
+    struct PositionedGlyph {
+        font_i: usize,
+        glyph: Glyph,
+    }
+
+    let scale = PxScale::from(px);
+    let (baseline, height_px) = fonts.vertical_metrics(px);
+    let mut glyphs: Vec<PositionedGlyph> = Vec::new();
     let mut caret = 0.0f32;
-    let mut prev: Option<ab_glyph::GlyphId> = None;
+    let mut prev: Option<(usize, GlyphId)> = None;
     for c in text.chars() {
-        let id = scaled.glyph_id(c);
-        if let Some(p) = prev {
-            caret += scaled.kern(p, id);
+        let Some((font_i, id)) = fonts.glyph_for(c) else {
+            prev = None;
+            continue;
+        };
+        let font = &fonts.fonts[font_i];
+        let scaled = font.as_scaled(scale);
+        if let Some((prev_i, prev_id)) = prev {
+            if prev_i == font_i {
+                caret += scaled.kern(prev_id, id);
+            }
         }
-        let mut g = id.with_scale(PxScale::from(px));
-        g.position = ab_glyph::point(caret, scaled.ascent());
+        let mut glyph = id.with_scale(scale);
+        glyph.position = ab_glyph::point(caret, baseline);
         caret += scaled.h_advance(id);
-        glyphs.push(g);
-        prev = Some(id);
+        glyphs.push(PositionedGlyph { font_i, glyph });
+        prev = Some((font_i, id));
     }
     let width = (caret.ceil() as usize + 4).max(1);
-    let height = (scaled.height().ceil() as usize + 4).max(1);
+    let height = (height_px.ceil() as usize + 4).max(1);
     let mut mask = vec![false; width * height];
     for g in glyphs {
-        if let Some(outline) = font.outline_glyph(g) {
+        if let Some(outline) = fonts.fonts[g.font_i].outline_glyph(g.glyph) {
             let bounds = outline.px_bounds();
             outline.draw(|x, y, cov| {
                 if cov > 0.5 {
@@ -50,16 +105,27 @@ pub fn rasterize_line(font: &FontRef, text: &str, px: f32) -> Line {
 
 /// Measure the advance width of text at `px` without rasterizing.
 pub fn measure(font: &FontRef, text: &str, px: f32) -> f32 {
-    let scaled = font.as_scaled(PxScale::from(px));
+    measure_stack(&FontStack::single(font.clone()), text, px)
+}
+
+/// Measure text with per-character font fallback.
+pub fn measure_stack(fonts: &FontStack, text: &str, px: f32) -> f32 {
+    let scale = PxScale::from(px);
     let mut caret = 0.0f32;
-    let mut prev: Option<ab_glyph::GlyphId> = None;
+    let mut prev: Option<(usize, GlyphId)> = None;
     for c in text.chars() {
-        let id = scaled.glyph_id(c);
-        if let Some(p) = prev {
-            caret += scaled.kern(p, id);
+        let Some((font_i, id)) = fonts.glyph_for(c) else {
+            prev = None;
+            continue;
+        };
+        let scaled = fonts.fonts[font_i].as_scaled(scale);
+        if let Some((prev_i, prev_id)) = prev {
+            if prev_i == font_i {
+                caret += scaled.kern(prev_id, id);
+            }
         }
         caret += scaled.h_advance(id);
-        prev = Some(id);
+        prev = Some((font_i, id));
     }
     caret
 }
@@ -216,6 +282,59 @@ pub fn wrap(font: &FontRef, text: &str, px: f32, max_px: f32) -> Vec<String> {
     lines
 }
 
+/// Wrap text with fallback-font measurement. Non-ASCII runs can break between
+/// characters, which keeps Chinese/Japanese/Korean replies inside the page.
+pub fn wrap_stack(fonts: &FontStack, text: &str, px: f32, max_px: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    for para in text.lines() {
+        let mut cur = String::new();
+        for token in wrap_tokens(para) {
+            if token == " " {
+                if !cur.is_empty() && !cur.ends_with(' ') {
+                    cur.push(' ');
+                }
+                continue;
+            }
+
+            let cand = if cur.is_empty() { token.clone() } else { format!("{cur}{token}") };
+            if measure_stack(fonts, &cand, px) <= max_px || cur.is_empty() {
+                cur = cand;
+            } else {
+                lines.push(cur.trim_end().to_string());
+                cur = token.trim_start().to_string();
+            }
+        }
+        if !cur.trim().is_empty() {
+            lines.push(cur.trim_end().to_string());
+        }
+    }
+    lines
+}
+
+fn wrap_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut ascii_word = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !ascii_word.is_empty() {
+                tokens.push(std::mem::take(&mut ascii_word));
+            }
+            tokens.push(" ".to_string());
+        } else if ch.is_ascii() {
+            ascii_word.push(ch);
+        } else {
+            if !ascii_word.is_empty() {
+                tokens.push(std::mem::take(&mut ascii_word));
+            }
+            tokens.push(ch.to_string());
+        }
+    }
+    if !ascii_word.is_empty() {
+        tokens.push(ascii_word);
+    }
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +356,25 @@ mod tests {
         // Wrap sanity.
         let lines = wrap(&font, "Do you know anything about the Chamber of Secrets?", 96.0, 1380.0);
         assert!(lines.len() >= 2);
+    }
+
+    #[test]
+    fn fallback_font_renders_chinese_and_wraps_without_spaces() {
+        let primary = FontRef::try_from_slice(include_bytes!("../fonts/DancingScript.ttf")).unwrap();
+        let cjk = FontRef::try_from_slice(include_bytes!("../fonts/LXGWWenKai-Regular.ttf")).unwrap();
+        assert_eq!(primary.glyph_id('你').0, 0);
+        assert_ne!(cjk.glyph_id('你').0, 0);
+
+        let fonts = FontStack::with_fallbacks(primary, [cjk]);
+        let mut line = rasterize_line_stack(&fonts, "Tom, 你好。", 96.0);
+        assert!(line.width > 250 && line.height > 50);
+        let inked_before: usize = line.mask.iter().filter(|&&v| v).count();
+        assert!(inked_before > 500, "expected Chinese glyphs to produce ink, got {inked_before}");
+        thin(&mut line);
+        assert!(!trace(&line).is_empty());
+
+        let wrapped = wrap_stack(&fonts, "这是一个没有空格的中文句子，用来确认换行不会超出页面。", 96.0, 520.0);
+        assert!(wrapped.len() > 1, "Chinese text without spaces should wrap");
+        assert!(wrapped.iter().all(|line| measure_stack(&fonts, line, 96.0) <= 520.0));
     }
 }

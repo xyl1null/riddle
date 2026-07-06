@@ -1,5 +1,7 @@
 fn main() {
-    if std::env::var("CARGO_FEATURE_TAKEOVER").is_ok() {
+    let takeover = std::env::var("CARGO_FEATURE_TAKEOVER").is_ok();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if takeover && target_os == "linux" {
         // libquill.so + libqsgepaper.so from the quill project.
         let quill = concat!(env!("CARGO_MANIFEST_DIR"), "/../quill");
         println!("cargo:rustc-link-search=native={quill}/build");
@@ -14,5 +16,7 @@ fn main() {
             let sysroot = format!("{home}/rm-sdk-3.26/sysroots/cortexa53-crypto-remarkable-linux/usr/lib");
             println!("cargo:rustc-link-arg=-Wl,-rpath-link,{sysroot}");
         }
+    } else if takeover {
+        println!("cargo:warning=takeover feature is only linked on Linux/reMarkable targets; using the native target backend");
     }
 }

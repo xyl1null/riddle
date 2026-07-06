@@ -2,7 +2,9 @@
 //! for the oracle.
 
 use crate::fb::BBox;
-use crate::surface::{Surface, BLACK, WHITE};
+use crate::surface::{Surface, BLACK};
+
+const INK_LUMA_CUTOFF: u8 = 190;
 
 pub struct Ink {
     /// Finished strokes as point lists (x, y, radius).
@@ -49,14 +51,14 @@ impl Ink {
         dirty
     }
 
-    /// Eraser tip: brush white over the page.
+    /// Eraser tip: restore the underlying paper texture.
     pub fn erase_point(&mut self, surf: &mut Surface, x: i32, y: i32, r: i32) -> BBox {
         let mut dirty = BBox::empty();
         if let Some((px, py)) = self.last_erase {
-            surf.brush_line(px, py, x, y, r, WHITE);
+            surf.brush_paper_line(px, py, x, y, r);
             dirty.add(px, py, r + 2);
         } else {
-            surf.stamp(x, y, r, WHITE);
+            surf.stamp_paper(x, y, r);
         }
         dirty.add(x, y, r + 2);
         self.last_erase = Some((x, y));
@@ -95,7 +97,8 @@ impl Ink {
                         acc += surf.luma((x0 + ox * f + sx) as i32, (y0 + oy * f + sy) as i32) as u32;
                     }
                 }
-                gray[oy * w + ox] = (acc / (f * f) as u32) as u8;
+                let avg = (acc / (f * f) as u32) as u8;
+                gray[oy * w + ox] = if avg > INK_LUMA_CUTOFF { 255 } else { avg };
             }
         }
 
@@ -122,16 +125,16 @@ fn px_hash(x: i32, y: i32) -> u32 {
     h ^ (h >> 16)
 }
 
-/// One pass of the "diary drinks the ink" effect: erase the pixels whose hash
-/// falls in this stage. After `stages` passes the region is clean white.
+/// One pass of the "diary drinks the ink" effect: erase the ink pixels whose
+/// hash falls in this stage. After `stages` passes the region is clean paper.
 pub fn dissolve_pass(surf: &mut Surface, region: BBox, stage: u32, stages: u32) {
     if region.is_empty() {
         return;
     }
     for y in region.y0..=region.y1 {
         for x in region.x0..=region.x1 {
-            if surf.luma(x, y) < 250 && px_hash(x, y) % stages <= stage {
-                surf.put_px(x, y, WHITE);
+            if surf.luma(x, y) < INK_LUMA_CUTOFF && px_hash(x, y) % stages <= stage {
+                surf.put_paper_px(x, y);
             }
         }
     }

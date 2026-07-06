@@ -1,18 +1,21 @@
-//! Display backends: qtfb (windowed, inside xochitl) and quill (takeover,
-//! vendor engine, xochitl stopped). Selected at runtime: if QTFB_KEY is set
-//! we're an AppLoad app; otherwise we assume takeover.
+//! Display backends: qtfb (windowed, inside xochitl), quill (takeover,
+//! vendor engine, xochitl stopped), and a macOS desktop window for local
+//! development. Selected at runtime: QTFB_KEY picks AppLoad, macOS defaults to
+//! desktop, otherwise takeover is used when compiled in.
 
 use crate::surface::{PixFmt, Surface};
 use std::io;
 
 pub enum Display {
     Qtfb(crate::qtfb::QtfbClient),
+    #[cfg(target_os = "macos")]
+    Desktop(crate::desktop::DesktopDisplay),
     #[allow(dead_code)]
     Quill,
 }
 
 // C ABI from libquill.so (linked when built with --features takeover).
-#[cfg(feature = "takeover")]
+#[cfg(all(feature = "takeover", target_os = "linux"))]
 mod quill_ffi {
     extern "C" {
         pub fn quill_init() -> i32;
@@ -26,6 +29,15 @@ mod quill_ffi {
 }
 
 impl Display {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Display::Qtfb(_) => "qtfb",
+            #[cfg(target_os = "macos")]
+            Display::Desktop(_) => "desktop",
+            Display::Quill => "quill/takeover",
+        }
+    }
+
     pub fn open() -> io::Result<(Self, Surface)> {
         if let Ok(key) = std::env::var("QTFB_KEY") {
             let key: i32 = key.parse().map_err(io::Error::other)?;
@@ -43,7 +55,13 @@ impl Display {
             return Ok((Display::Qtfb(client), surface));
         }
 
-        #[cfg(feature = "takeover")]
+        #[cfg(target_os = "macos")]
+        {
+            let (desktop, surface) = crate::desktop::DesktopDisplay::open()?;
+            Ok((Display::Desktop(desktop), surface))
+        }
+
+        #[cfg(all(feature = "takeover", target_os = "linux"))]
         {
             unsafe {
                 if quill_ffi::quill_init() != 0 {
@@ -60,21 +78,25 @@ impl Display {
                 Ok((Display::Quill, surface))
             }
         }
-        #[cfg(not(feature = "takeover"))]
+        #[cfg(not(any(target_os = "macos", all(feature = "takeover", target_os = "linux"))))]
         Err(io::Error::other(
             "QTFB_KEY not set and this build has no takeover backend",
         ))
     }
 
     /// Push a region to the panel. `fast` selects the low-latency waveform.
-    pub fn update(&self, x: i32, y: i32, w: i32, h: i32, _fast: bool) {
+    pub fn update(&mut self, x: i32, y: i32, w: i32, h: i32, _fast: bool) {
         match self {
             Display::Qtfb(c) => {
                 let _ = c.update_partial(x, y, w, h);
             }
+            #[cfg(target_os = "macos")]
+            Display::Desktop(d) => {
+                d.update_region(x, y, w, h);
+            }
             #[allow(unused_variables)]
             Display::Quill => {
-                #[cfg(feature = "takeover")]
+                #[cfg(all(feature = "takeover", target_os = "linux"))]
                 unsafe {
                     // mode 0 = fastest (ink), 3 = balanced (text/anim)
                     quill_ffi::quill_swap(x, y, w, h, if _fast { 0 } else { 3 }, 0);
@@ -84,14 +106,18 @@ impl Display {
         }
     }
 
-    pub fn update_all(&self, w: usize, h: usize) {
+    pub fn update_all(&mut self, w: usize, h: usize) {
         match self {
             Display::Qtfb(c) => {
                 let _ = c.update_all();
             }
+            #[cfg(target_os = "macos")]
+            Display::Desktop(d) => {
+                d.update_all();
+            }
             #[allow(unused_variables)]
             Display::Quill => {
-                #[cfg(feature = "takeover")]
+                #[cfg(all(feature = "takeover", target_os = "linux"))]
                 unsafe {
                     quill_ffi::quill_swap(0, 0, w as i32, h as i32, 3, 0);
                     quill_ffi::quill_process_events();
@@ -102,14 +128,18 @@ impl Display {
     }
 
     /// Flashing clear of the whole panel (ghost removal).
-    pub fn full_refresh(&self, w: usize, h: usize) {
+    pub fn full_refresh(&mut self, w: usize, h: usize) {
         match self {
             Display::Qtfb(c) => {
                 let _ = c.request_full_refresh();
             }
+            #[cfg(target_os = "macos")]
+            Display::Desktop(d) => {
+                d.full_refresh();
+            }
             #[allow(unused_variables)]
             Display::Quill => {
-                #[cfg(feature = "takeover")]
+                #[cfg(all(feature = "takeover", target_os = "linux"))]
                 unsafe {
                     quill_ffi::quill_swap(0, 0, w as i32, h as i32, 4, 1);
                     quill_ffi::quill_process_events();
@@ -121,11 +151,13 @@ impl Display {
 
     /// Drain window-system events. For qtfb this also detects window close
     /// (returns Err); the takeover backend has no window to lose.
-    pub fn pump(&self) -> io::Result<Vec<crate::qtfb::InputEvent>> {
+    pub fn pump(&mut self) -> io::Result<Vec<crate::qtfb::InputEvent>> {
         match self {
             Display::Qtfb(c) => c.drain_events(),
+            #[cfg(target_os = "macos")]
+            Display::Desktop(d) => d.pump(),
             Display::Quill => {
-                #[cfg(feature = "takeover")]
+                #[cfg(all(feature = "takeover", target_os = "linux"))]
                 unsafe {
                     quill_ffi::quill_process_events();
                 }
@@ -134,9 +166,12 @@ impl Display {
         }
     }
 
-    pub fn terminate(&self) {
-        if let Display::Qtfb(c) = self {
-            c.terminate();
+    pub fn terminate(&mut self) {
+        match self {
+            Display::Qtfb(c) => c.terminate(),
+            #[cfg(target_os = "macos")]
+            Display::Desktop(_) => {}
+            Display::Quill => {}
         }
     }
 }

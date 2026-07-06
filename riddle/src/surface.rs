@@ -23,8 +23,11 @@ pub struct Surface {
 // Single-threaded writer over a long-lived mapping.
 unsafe impl Send for Surface {}
 
-pub const WHITE: u16 = 0xFFFF;
 pub const BLACK: u16 = 0x0000;
+
+pub const fn rgb565(r: u8, g: u8, b: u8) -> u16 {
+    (((r as u16 & 0xF8) << 8) | ((g as u16 & 0xFC) << 3) | ((b as u16) >> 3)) as u16
+}
 
 #[inline]
 fn expand565(c: u16) -> (u8, u8, u8) {
@@ -36,6 +39,11 @@ fn expand565(c: u16) -> (u8, u8, u8) {
         ((g * 255 + 31) / 63) as u8,
         ((b * 255 + 15) / 31) as u8,
     )
+}
+
+#[inline]
+pub fn paper_at(_x: i32, _y: i32) -> u16 {
+    rgb565(224, 224, 224)
 }
 
 impl Surface {
@@ -105,6 +113,21 @@ impl Surface {
         for row in y..y1 {
             for col in x..x1 {
                 self.put_px(col as i32, row as i32, c);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn put_paper_px(&mut self, x: i32, y: i32) {
+        self.put_px(x, y, paper_at(x, y));
+    }
+
+    pub fn fill_paper_rect(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        let x1 = (x + w).min(self.w);
+        let y1 = (y + h).min(self.h);
+        for row in y..y1 {
+            for col in x..x1 {
+                self.put_paper_px(col as i32, row as i32);
             }
         }
     }
@@ -179,6 +202,16 @@ impl Surface {
         }
     }
 
+    pub fn stamp_paper(&mut self, cx: i32, cy: i32, r: i32) {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy <= r * r {
+                    self.put_paper_px(cx + dx, cy + dy);
+                }
+            }
+        }
+    }
+
     pub fn brush_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, r: i32, c: u16) {
         let dx = (x1 - x0).abs();
         let dy = (y1 - y0).abs();
@@ -187,6 +220,17 @@ impl Surface {
             let x = x0 + (x1 - x0) * i / steps;
             let y = y0 + (y1 - y0) * i / steps;
             self.stamp(x, y, r, c);
+        }
+    }
+
+    pub fn brush_paper_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, r: i32) {
+        let dx = (x1 - x0).abs();
+        let dy = (y1 - y0).abs();
+        let steps = dx.max(dy).max(1);
+        for i in 0..=steps {
+            let x = x0 + (x1 - x0) * i / steps;
+            let y = y0 + (y1 - y0) * i / steps;
+            self.stamp_paper(x, y, r);
         }
     }
 }

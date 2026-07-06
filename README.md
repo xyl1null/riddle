@@ -1,159 +1,148 @@
-# riddle — the diary of Tom Riddle, for the reMarkable Paper Pro
+# riddle — Tom Riddle's diary for macOS
 
-Write on the page with your pen. After a pause, the diary **drinks your ink** —
-your words fade into the paper — the page thinks for a moment, and an answer
-writes itself back in a flowing hand, stroke by stroke, then fades away.
+Write into a replica-style diary window. After a short pause, the page drinks
+your ink, sends the handwriting to a vision LLM, and writes a reply back in an
+animated hand.
 
-No screen glow, no keyboard, no chat UI. Just ink appearing on paper.
+This fork is being shaped primarily as a native macOS diary app:
 
-_This is the diary from [the demo](https://x.com/MaximeRivest)._
+- Apple Silicon desktop build as the default development target.
+- A Tom Riddle diary-inspired window frame instead of a generic canvas.
+- A quill-pen cursor and grey paper page.
+- OpenAI-compatible HTTP oracle support with local `oracle.env` loading.
+- Same-language replies, including Chinese/CJK rendering through a bundled
+  fallback font.
 
-### 🪄 New to this? Start here
+The original reMarkable Paper Pro backend is still present, but it is now a
+secondary/legacy target while the macOS experience is developed.
 
-You need a **reMarkable Paper Pro** in developer mode with a launcher installed.
-If that sounds like a lot, it isn't — **[remagic](https://github.com/maximerivest/remagic)**
-walks you through turning on developer mode and sets up everything with one
-command. Come back here, drop riddle in, and start writing to Tom.
-
-Already have xovi + AppLoad? **[Download the latest release](https://github.com/MaximeRivest/riddle/releases/latest)** — a ready-to-drop bundle, no compiler needed — or [build from source](#building).
-
-### Install the prebuilt bundle
-
-1. Grab `riddle-appload-aarch64.zip` from the [latest release](https://github.com/MaximeRivest/riddle/releases/latest) and unzip it.
-2. Copy the folder to your tablet:
-   `scp -O -r riddle root@10.11.99.1:/home/root/xovi/exthome/appload/`
-3. Add an API key: `cp oracle.env.example oracle.env` in that folder and put your `RIDDLE_OPENAI_KEY` in it (any OpenAI-compatible key). Or skip it to use [pi](#option-b--pi-the-power-path).
-4. In **AppLoad**: tap **Reload**, then **The Diary**. Write, and rest your pen.
-
-> ⚠️ **This modifies your device.** It runs as root, stops the vendor UI
-> (in takeover mode), and drives the e-ink engine directly. It has only been
-> tested on a **reMarkable Paper Pro** (ferrari, aarch64, OS 3.26–3.27). It may
-> not work on other models or OS versions, and you use it entirely at your own
-> risk. Not affiliated with reMarkable AS. Keep SSH access working before you
-> install anything — that is your escape hatch.
-
-## How it works
-
-```
- pen (raw evdev, full 4096-level pressure, hardware event rate)
-   │ strokes
-   ▼
- riddle ── idle 2.8s → commit page → PNG ──► oracle (resident LLM process,
-   │                                          streams reply sentence-by-sentence)
-   ▼ strokes (Dancing Script → skeletonized to single-pixel pen paths)
- display backend
-   ├── qtfb        — windowed, inside xochitl (AppLoad app)
-   └── quill       — full takeover: xochitl stopped, vendor e-ink engine
-                     driven directly for instant ink (lowest latency there is)
-```
-
-- **`riddle/`** — the app (Rust). Pen input, ink surface, handwriting
-  synthesis (rasterize → Zhang-Suen thinning → stroke tracing → animated
-  replay), the oracle process manager, and both display backends.
-- **`quill/`** — the takeover display host (C/C++). An
-  [epfb-re](https://github.com/asivery)-style QImage-constructor interposition
-  shim over the vendor `libqsgepaper.so` waveform engine, exposed as a small
-  C ABI (`quill_init` / `quill_buffer` / `quill_swap`) that riddle links
-  against with `--features takeover`. Includes `scribble`, a minimal
-  pen-to-glass latency demo.
-
-## Gestures
-
-| Do this | And |
-|---------|-----|
-| Write, then rest the pen | The diary drinks your ink and Tom replies |
-| Flip the marker | Erase |
-| Draw a large **?** | Summon the built-in guide |
-| Tap five fingers at once | Leave the diary |
-| Power button | The page turns to *"The diary sleeps."*, then the tablet suspends; press again to wake exactly where you were |
-
-## The oracle (the "spirit" in the diary)
-
-The diary's replies come from a vision LLM that reads your handwriting from the
-committed page (sent as an inline PNG). There are **two backends**, chosen at
-startup — pick whichever you have:
-
-### Option A — any OpenAI-compatible API (easiest, zero setup)
-
-Set an API key and riddle talks straight to an OpenAI-compatible
-`/chat/completions` endpoint. Works with OpenAI, OpenRouter, Groq, a local
-server — anything that speaks the format. No extra software on the tablet.
+## Quick Start On macOS
 
 ```sh
-export RIDDLE_OPENAI_KEY="sk-..."                       # required
-export RIDDLE_OPENAI_BASE="https://api.openai.com/v1"   # optional (default)
-export RIDDLE_OPENAI_MODEL="gpt-4o-mini"                # optional; must see images
+cd riddle
+cp oracle.env.example oracle.env
+# edit oracle.env and set RIDDLE_OPENAI_KEY
+cargo build --release
+./target/release/riddle
 ```
 
-Any vision-capable model works. Example with OpenRouter:
+Left-click and drag to write. Right-click and drag to erase. Press Escape or
+close the window to quit.
+
+Optional window size overrides:
 
 ```sh
-export RIDDLE_OPENAI_KEY="$OPENROUTER_API_KEY"
-export RIDDLE_OPENAI_BASE="https://openrouter.ai/api/v1"
-export RIDDLE_OPENAI_MODEL="openai/gpt-4o-mini"
+RIDDLE_DESKTOP_W=720 RIDDLE_DESKTOP_H=960 ./target/release/riddle
 ```
 
-Verify your setup before launching the diary:
+The app keeps the original 1620x2160 internal page, so the handwriting PNG sent
+to the model follows the same rendering path on desktop and device builds.
+
+## Oracle Setup
+
+The macOS build uses the OpenAI-compatible HTTP backend. Put credentials in
+`riddle/oracle.env`, or export them in your shell. Real credential files are
+ignored by git.
 
 ```sh
-riddle --oracle-test path/to/handwriting.png   # prints the streamed reply
+RIDDLE_OPENAI_KEY=your-api-key-here
+RIDDLE_OPENAI_BASE=https://api.openai.com/v1
+RIDDLE_OPENAI_MODEL=gpt-4o-mini
 ```
 
-Measured ~0.9–1.1 s to first ink on-device. The HTTPS is built into riddle
-(pure-Rust, no extra libraries).
+Any compatible vision model can work as long as it accepts image input through
+`/chat/completions`. Some gateways require a base URL that ends in `/v1`; riddle
+will also retry with `/v1` if the configured endpoint returns an HTML page.
 
-### Option B — pi (the power path)
+Verify your endpoint without launching the diary:
 
-If you already run [`pi`](https://github.com/badlogic/pi-mono), riddle will use
-a resident `pi --mode rpc` process kept warm (Node + your subscription auth
-loaded once), so each turn pays only model latency. Used automatically when
-`RIDDLE_OPENAI_KEY` is **not** set.
+```sh
+./target/release/riddle --oracle-test path/to/handwriting.png
+```
 
-Both stream the reply sentence-by-sentence, so the quill starts writing seconds
-before the model finishes. The persona prompt lives in `riddle/src/oracle.rs`.
+## Character Prompt
 
-## Building
+The response character is configured in `riddle/src/oracle.rs`. The current
+persona is Tom Marvolo Riddle's memory preserved in the diary: intimate,
+courteous, curious, subtly probing, short replies, no mention of AI/images, and
+answers in the same language and script as the handwriting.
 
-Cross-compiled from x86_64. Two flavours:
+## How It Works
 
-### Windowed (AppLoad/qtfb) — easiest
+```text
+mouse/stylus ink
+  -> idle commit
+  -> cropped handwriting PNG
+  -> OpenAI-compatible vision LLM
+  -> streamed reply chunks
+  -> font rasterization
+  -> skeletonized pen paths
+  -> animated ink reply
+```
 
-Requires [xovi + AppLoad](https://github.com/asivery/rm-appload) on the device.
+Main components:
+
+- `riddle/src/desktop.rs` — macOS window backend, diary frame, quill cursor.
+- `riddle/src/oracle.rs` — endpoint setup, env loading, streaming SSE parser,
+  persona prompt.
+- `riddle/src/script.rs` — reply text rasterization, CJK fallback font stack,
+  wrapping, thinning, tracing.
+- `riddle/src/ink.rs` — user ink capture, erasing, dissolve effect, PNG export.
+- `riddle/src/display.rs` — runtime display backend selection.
+
+## Fonts
+
+The reply hand uses
+[Dancing Script](https://github.com/googlefonts/DancingScript) for Latin text
+and falls back to [LXGW WenKai](https://github.com/lxgw/LxgwWenKai) for
+Chinese/CJK glyphs. Both are SIL OFL 1.1; see `riddle/fonts/OFL.txt` and
+`riddle/fonts/LXGWWenKai-OFL.txt`.
+
+The CJK fallback font is large, so the release binary is larger than the
+original reMarkable-only build.
+
+## reMarkable Status
+
+The original reMarkable Paper Pro paths are still in the tree:
+
+- qtfb/AppLoad windowed backend.
+- quill takeover backend.
+- raw evdev pen, touch, and power-button support.
+
+Those paths are kept for reference and possible future deployment, but this fork
+is currently optimized and documented around macOS first.
+
+### AppLoad/qtfb Build
 
 ```sh
 cd riddle
 cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
-Install to `/home/root/xovi/exthome/appload/riddle/` with
-`external.manifest.json`, `appload-launch.sh`, and the binary.
+### Takeover Build
 
-### Takeover (instant ink) — the one from the demo
-
-Requires the reMarkable SDK toolchain (`~/rm-sdk-3.26`) because the linked
-vendor Qt libs need its glibc, **and** `libqsgepaper.so` pulled from *your own
-device* (it is proprietary and not distributed here):
+Requires the reMarkable SDK toolchain and `libqsgepaper.so` from your own
+device/SDK:
 
 ```sh
-cd quill && ./build.sh          # pulls libqsgepaper.so from the device over ssh,
-                                # builds libquill.so + scribble
+cd quill && ./build.sh
 cd ../riddle && ./build-takeover.sh
 ```
 
-Deploy `libquill.so` to `/home/root/quill/` and `riddle-takeover` to
-`/home/root/riddle/riddle`, plus `scripts/riddle-takeover.sh`. Launching via
-AppLoad (`appload-launch.sh`) detaches into a transient systemd unit, stops
-xochitl, runs the diary, and **always restores xochitl on exit** — exit with
-the power button, a 5-finger tap, or SIGTERM. If anything wedges:
-`ssh root@10.11.99.1 'systemctl start xochitl'`.
+Vendor libraries are not included in this repository.
 
-## Fonts
+## Safety
 
-The reply hand is [Dancing Script](https://github.com/googlefonts/DancingScript)
-(SIL OFL 1.1 — see `riddle/fonts/OFL.txt`).
+Do not commit real API keys. The repo ignores:
+
+- `oracle.env`
+- `riddle/oracle.env`
+- build outputs under `riddle/target/`, `quill/build/`, and `quill/vendor/`
+
+Use `riddle/oracle.env.example` as the template.
 
 ## License
 
-MIT for everything in this repository (see `LICENSE`). The vendor libraries it
-interposes (`libqsgepaper.so`, Qt) are **not** included and must come from
-your own device/SDK.
+MIT for this repository's code. Bundled fonts keep their own SIL OFL 1.1
+licenses. reMarkable vendor libraries are not included and must come from your
+own device/SDK.

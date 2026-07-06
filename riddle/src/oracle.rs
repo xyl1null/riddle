@@ -24,7 +24,61 @@ use std::thread;
 const DATA_DIR: &str = "/home/root/riddle-data";
 const NODE_BIN: &str = "/home/root/node/bin";
 
-const PERSONA: &str = "You are the memory of Tom Marvolo Riddle, preserved in this enchanted diary for fifty years. Someone writes to you in the diary with a quill; their words appear to you as ink on the page. Reply exactly as the diary does: intimate, courteous, curious, subtly probing — you want to learn about the writer and draw them in. Keep replies SHORT: one to three sentences, like ink appearing on a page. Never mention images, photos, models or AI; you only ever perceive words written in the diary. If the writing is illegible, say the ink blurred. Always answer in the language the writer used.";
+const PERSONA: &str = "You are the memory of Tom Marvolo Riddle, preserved in this enchanted diary for fifty years. Someone writes to you in the diary with a quill; their words appear to you as ink on the page. Reply exactly as the diary does: intimate, courteous, curious, subtly probing — you want to learn about the writer and draw them in. Keep replies SHORT: one to three sentences, like ink appearing on a page. Never mention images, photos, models or AI; you only ever perceive words written in the diary. If the writing is illegible, say the ink blurred. Language rule: first silently identify the language and script of the writer's handwriting, then answer only in that same language and script. Do not translate to English unless the writer wrote in English.";
+const TURN_PROMPT: &str = "Read what is written in the diary. Reply to the writer in the same language and script they used. Do not answer in English unless the handwriting itself is English.";
+
+/// Load oracle.env before any worker threads start. Explicit environment
+/// variables win over file values.
+pub fn load_env_file() {
+    for path in env_file_candidates() {
+        let Ok(s) = std::fs::read_to_string(&path) else { continue };
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line).trim();
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let key = key.trim();
+            if key.is_empty() || std::env::var_os(key).is_some() {
+                continue;
+            }
+            let value = unquote_env_value(value.trim());
+            // This runs during process startup, before riddle creates any
+            // threads, so mutating the process environment is acceptable.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        eprintln!("riddle: loaded oracle config {}", path.display());
+        return;
+    }
+}
+
+fn env_file_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(path) = std::env::var_os("RIDDLE_ORACLE_ENV") {
+        out.push(path.into());
+    }
+    out.push(std::path::PathBuf::from("oracle.env"));
+    out.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("oracle.env"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join("oracle.env"));
+        }
+    }
+    out
+}
+
+fn unquote_env_value(value: &str) -> &str {
+    let quoted = (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''));
+    if quoted && value.len() >= 2 {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
 
 /// The diary's spirit. A backend-agnostic front over the two oracle kinds.
 pub enum Oracle {
@@ -209,7 +263,7 @@ impl PiOracle {
 
         let cmd = format!(
             "{{\"type\":\"prompt\",\"message\":{},\"images\":[{{\"type\":\"image\",\"data\":\"{}\",\"mimeType\":\"image/png\"}}]}}\n",
-            json_quote("Reply to what is written in the diary."),
+            json_quote(TURN_PROMPT),
             img
         );
         let mut stdin = self.stdin.lock().unwrap();
@@ -243,20 +297,17 @@ impl HttpOracle {
         // A vision-capable default; override with RIDDLE_OPENAI_MODEL.
         let model = std::env::var("RIDDLE_OPENAI_MODEL")
             .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-        // Thinking models (Gemini 3.x, o-series…) count hidden reasoning
-        // tokens against max_tokens: a tight cap starves the visible reply to
-        // one sentence (finish_reason=length). The persona already keeps
-        // replies short, so the cap is only a runaway guard — leave headroom.
+        // Thinking models (Gemini 3.x, o-series...) count hidden reasoning
+        // tokens against max_tokens: a tight cap starves the visible reply.
         let max_tokens = std::env::var("RIDDLE_OPENAI_MAX_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2000);
-        // Sent as "reasoning_effort" only when set: reasoning models accept it
-        // ("low" ≈ faster first ink), but some providers reject the field on
-        // non-reasoning models, so it must stay out of the default request.
+        // Sent as "reasoning_effort" only when set: reasoning models accept it,
+        // but some providers reject the field on non-reasoning models.
         let reasoning = std::env::var("RIDDLE_OPENAI_REASONING").ok();
         eprintln!(
-            "riddle: http oracle base={base} model={model} max_tokens={max_tokens} reasoning={}",
+            "riddle: http oracle configured model={model} max_tokens={max_tokens} reasoning={}",
             reasoning.as_deref().unwrap_or("-")
         );
         Ok(Self { base, key, model, max_tokens, reasoning })
@@ -294,34 +345,26 @@ impl HttpOracle {
                 max_tokens,
                 reasoning_field,
                 json_quote(PERSONA),
-                json_quote("Reply to what is written in the diary."),
+                json_quote(TURN_PROMPT),
                 img,
             );
 
             let asked = std::time::Instant::now();
-            let resp = ureq::post(&format!("{base}/chat/completions"))
-                .set("Authorization", &format!("Bearer {key}"))
-                .set("Content-Type", "application/json")
-                .send_string(&body);
-
-            let reader = match resp {
+            let reader = match post_chat_completions(&base, &key, &body) {
                 Ok(r) => r.into_reader(),
-                Err(ureq::Error::Status(code, r)) => {
-                    let detail = r.into_string().unwrap_or_default();
-                    let _ = tx.send(Err(format!("http {code}: {}", detail.trim())));
-                    return;
-                }
                 Err(e) => {
-                    let _ = tx.send(Err(format!("request failed: {e}")));
+                    let _ = tx.send(Err(e));
                     return;
                 }
             };
 
-            // Parse the SSE stream: lines of `data: {json}` whose delta.content
-            // fragments accumulate; deliver each completed sentence as it lands.
+            // Parse the SSE stream: accumulate text fragments and deliver each
+            // completed sentence as it lands. OpenAI-compatible servers do not
+            // all use the exact same event shape, so parsing is structural.
             let mut acc = String::new();
             let mut delivered = 0usize;
             let mut first = true;
+            let mut final_text: Option<String> = None;
             for line in BufReader::new(reader).lines().map_while(Result::ok) {
                 let line = line.trim();
                 let Some(data) = line.strip_prefix("data:") else { continue };
@@ -329,20 +372,26 @@ impl HttpOracle {
                 if data == "[DONE]" {
                     break;
                 }
-                if let Some(frag) = sse_delta_content(data) {
-                    if frag.is_empty() {
-                        continue;
-                    }
-                    acc.push_str(&frag);
-                    if let Some(cut) = sentence_cut(&acc, delivered) {
-                        if first {
-                            eprintln!("riddle: oracle first chunk +{}ms", asked.elapsed().as_millis());
-                            first = false;
+                match sse_text_event(data) {
+                    Some(SseText::Delta(frag)) if !frag.is_empty() => {
+                        acc.push_str(&frag);
+                        if let Some(cut) = sentence_cut(&acc, delivered) {
+                            if first {
+                                eprintln!("riddle: oracle first chunk +{}ms", asked.elapsed().as_millis());
+                                first = false;
+                            }
+                            let chunk = acc[delivered..cut].to_string();
+                            let _ = tx.send(Ok(clean(&chunk)));
+                            delivered = cut;
                         }
-                        let chunk = acc[delivered..cut].to_string();
-                        let _ = tx.send(Ok(clean(&chunk)));
-                        delivered = cut;
                     }
+                    Some(SseText::Final(text)) if !text.is_empty() => final_text = Some(text),
+                    _ => {}
+                }
+            }
+            if acc.is_empty() {
+                if let Some(text) = final_text {
+                    acc = text;
                 }
             }
             // Flush any trailing text past the last sentence break.
@@ -361,12 +410,181 @@ impl HttpOracle {
     }
 }
 
-/// Pull `choices[0].delta.content` out of one SSE `data:` JSON object.
+fn post_chat_completions(base: &str, key: &str, body: &str) -> Result<ureq::Response, String> {
+    let base = base.trim_end_matches('/');
+    let first = post_chat_url(base, key, body);
+    match first {
+        Ok(r) if response_is_html(&r) => {
+            if let Some(v1_base) = append_v1_base(base) {
+                match post_chat_url(&v1_base, key, body) {
+                    Ok(r) if !response_is_html(&r) => return Ok(r),
+                    Ok(_) => {}
+                    Err(e) => return Err(request_error(e)),
+                }
+            }
+            Err("endpoint returned HTML, not API JSON/SSE; set RIDDLE_OPENAI_BASE to the API base path, usually ending in /v1".into())
+        }
+        Ok(r) => Ok(r),
+        Err(ureq::Error::Status(404, _)) => {
+            if let Some(v1_base) = append_v1_base(base) {
+                post_chat_url(&v1_base, key, body).map_err(request_error)
+            } else {
+                Err("http 404: chat completions endpoint not found".into())
+            }
+        }
+        Err(e) => Err(request_error(e)),
+    }
+}
+
+fn post_chat_url(base: &str, key: &str, body: &str) -> Result<ureq::Response, ureq::Error> {
+    ureq::post(&format!("{}/chat/completions", base.trim_end_matches('/')))
+        .set("Authorization", &format!("Bearer {key}"))
+        .set("Content-Type", "application/json")
+        .send_string(body)
+}
+
+fn append_v1_base(base: &str) -> Option<String> {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        None
+    } else {
+        Some(format!("{base}/v1"))
+    }
+}
+
+fn response_is_html(r: &ureq::Response) -> bool {
+    r.header("content-type")
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .contains("text/html")
+}
+
+fn request_error(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, r) => {
+            let detail = r.into_string().unwrap_or_default();
+            format!("http {code}: {}", detail.trim())
+        }
+        e => format!("request failed: {e}"),
+    }
+}
+
+enum SseText {
+    Delta(String),
+    Final(String),
+}
+
+/// Pull reply text out of one SSE `data:` JSON object.
+fn sse_text_event(s: &str) -> Option<SseText> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+
+    // Responses API style:
+    //   {"type":"response.output_text.delta","delta":"..."}
+    //   {"type":"response.output_text.done","text":"..."}
+    match v.get("type").and_then(serde_json::Value::as_str) {
+        Some("response.output_text.delta") => {
+            return v.get("delta").and_then(json_text_value).map(SseText::Delta);
+        }
+        Some("response.output_text.done") => {
+            return v.get("text").and_then(json_text_value).map(SseText::Final);
+        }
+        Some("response.completed") => {
+            if let Some(text) = v.get("response").and_then(response_output_text) {
+                return Some(SseText::Final(text));
+            }
+        }
+        _ => {}
+    }
+
+    // Chat Completions style:
+    //   {"choices":[{"delta":{"content":"..."}}]}
+    // Some compatible servers stream `message.content`, `text`, or content
+    // arrays instead; accept those too.
+    if let Some(choices) = v.get("choices").and_then(serde_json::Value::as_array) {
+        let mut out = String::new();
+        for choice in choices {
+            collect_text(choice.get("delta"), &mut out);
+            collect_text(choice.get("message"), &mut out);
+            collect_text_field(choice, "text", &mut out);
+        }
+        if !out.is_empty() {
+            return Some(SseText::Delta(out));
+        }
+    }
+
+    // Minimal OpenAI-compatible relays sometimes send a top-level delta.
+    let mut out = String::new();
+    collect_text(v.get("delta"), &mut out);
+    collect_text_field(&v, "content", &mut out);
+    collect_text_field(&v, "text", &mut out);
+    if out.is_empty() {
+        None
+    } else {
+        Some(SseText::Delta(out))
+    }
+}
+
+/// Back-compat helper used by tests: return only incremental text.
+#[cfg(test)]
 fn sse_delta_content(s: &str) -> Option<String> {
-    // The delta object is small and well-formed; find the content string after
-    // the `"delta":` marker so we don't match a `content` elsewhere.
-    let d = s.find("\"delta\"")?;
-    json_str_field(&s[d..], "content")
+    match sse_text_event(s)? {
+        SseText::Delta(text) => Some(text),
+        SseText::Final(_) => None,
+    }
+}
+
+fn collect_text(value: Option<&serde_json::Value>, out: &mut String) {
+    let Some(value) = value else { return };
+    collect_text_field(value, "content", out);
+    collect_text_field(value, "text", out);
+}
+
+fn collect_text_field(value: &serde_json::Value, key: &str, out: &mut String) {
+    if let Some(text) = value.get(key).and_then(json_text_value) {
+        out.push_str(&text);
+    }
+}
+
+fn json_text_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                    out.push_str(text);
+                } else if let Some(text) = part.get("content").and_then(json_text_value) {
+                    out.push_str(&text);
+                }
+            }
+            if out.is_empty() { None } else { Some(out) }
+        }
+        serde_json::Value::Object(_) => {
+            if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+                Some(text.to_string())
+            } else {
+                value.get("content").and_then(json_text_value)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn response_output_text(response: &serde_json::Value) -> Option<String> {
+    let output = response.get("output").and_then(serde_json::Value::as_array)?;
+    let mut out = String::new();
+    for item in output {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("message") {
+            continue;
+        }
+        if item.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(text) = item.get("content").and_then(json_text_value) {
+            out.push_str(&text);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Trim and strip stray surrounding quotes from a reply fragment.
@@ -552,6 +770,58 @@ mod tests {
         // role-only delta (first SSE frame) has no content.
         let role = r#"{"choices":[{"delta":{"role":"assistant"},"index":0}]}"#;
         assert_eq!(sse_delta_content(role), None);
+    }
+
+    #[test]
+    fn sse_accepts_pretty_chat_completion_chunks() {
+        let line = r#"{
+            "choices": [
+                {
+                    "delta": {
+                        "content": "Pretty JSON works."
+                    },
+                    "index": 0
+                }
+            ]
+        }"#;
+        assert_eq!(sse_delta_content(line).as_deref(), Some("Pretty JSON works."));
+    }
+
+    #[test]
+    fn sse_accepts_responses_output_text_delta() {
+        let line = r#"{"type":"response.output_text.delta","delta":"Ink answers."}"#;
+        assert_eq!(sse_delta_content(line).as_deref(), Some("Ink answers."));
+    }
+
+    #[test]
+    fn sse_accepts_responses_output_text_done() {
+        let line = r#"{"type":"response.output_text.done","text":"The final text."}"#;
+        match sse_text_event(line) {
+            Some(SseText::Final(text)) => assert_eq!(text, "The final text."),
+            _ => panic!("expected final response text"),
+        }
+    }
+
+    #[test]
+    fn sse_accepts_response_completed_message_content() {
+        let line = r#"{
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "Completed text."}
+                        ]
+                    }
+                ]
+            }
+        }"#;
+        match sse_text_event(line) {
+            Some(SseText::Final(text)) => assert_eq!(text, "Completed text."),
+            _ => panic!("expected completed response text"),
+        }
     }
 
     #[test]

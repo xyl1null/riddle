@@ -3,10 +3,13 @@
 //! Write on the page with the pen. After a pause the diary drinks your ink,
 //! and an answer writes itself onto the page in a flowing hand, then fades.
 //!
-//! Two display backends (picked at runtime): windowed via qtfb/AppLoad when
-//! QTFB_KEY is set, or full takeover via the vendor engine (quill) when
-//! built with --features takeover and launched with xochitl stopped.
+//! Display backends (picked at runtime): windowed via qtfb/AppLoad when
+//! QTFB_KEY is set, full takeover via the vendor engine (quill) when built
+//! with --features takeover and launched with xochitl stopped, or a macOS
+//! desktop window for local Apple Silicon development.
 
+#[cfg(target_os = "macos")]
+mod desktop;
 mod display;
 mod fb;
 mod help;
@@ -27,9 +30,10 @@ use std::time::{Duration, Instant};
 use ab_glyph::FontRef;
 
 use fb::{BBox, SCREEN_H, SCREEN_W};
-use surface::{Surface, BLACK, WHITE};
+use surface::BLACK;
 
 const FONT_TTF: &[u8] = include_bytes!("../fonts/DancingScript.ttf");
+const CJK_FONT_TTF: &[u8] = include_bytes!("../fonts/LXGWWenKai-Regular.ttf");
 const PNG_PATH: &str = "/tmp/riddle-page.png";
 
 const IDLE_COMMIT: Duration = Duration::from_millis(2800);
@@ -39,7 +43,7 @@ const MARGIN_X: i32 = 120;
 enum State {
     Listening { last_pen: Option<Instant> },
     Drinking { stage: u32, next: Instant, region: BBox, rx: mpsc::Receiver<Result<String, String>> },
-    Thinking { rx: mpsc::Receiver<Result<String, String>>, pulse: Instant, blot_on: bool },
+    Thinking { rx: mpsc::Receiver<Result<String, String>> },
     Replying { plan: WritePlan, next: Instant, rx: Option<mpsc::Receiver<Result<String, String>>> },
     Lingering { until: Instant, region: BBox },
     FadingReply { stage: u32, next: Instant, region: BBox },
@@ -62,6 +66,7 @@ fn main() {
     // and prints the streamed chunks, then exits. Lets you verify your endpoint
     // + key + model before ever launching the diary. No display needed.
     let args: Vec<String> = std::env::args().collect();
+    oracle::load_env_file();
     if args.get(1).map(String::as_str) == Some("--oracle-test") {
         let png = args.get(2).map(String::as_str).unwrap_or("/tmp/riddle-page.png");
         std::process::exit(oracle_test(png));
@@ -108,12 +113,14 @@ fn oracle_test(png: &str) -> i32 {
 
 fn run() -> std::io::Result<()> {
     let font = FontRef::try_from_slice(FONT_TTF).map_err(std::io::Error::other)?;
+    let cjk_font = FontRef::try_from_slice(CJK_FONT_TTF).map_err(std::io::Error::other)?;
+    let reply_fonts = script::FontStack::with_fallbacks(font.clone(), [cjk_font]);
 
-    let (disp, mut surf) = display::Display::open()?;
+    let (mut disp, mut surf) = display::Display::open()?;
     let takeover = matches!(disp, display::Display::Quill);
     eprintln!(
         "riddle: display {} ({}x{} stride {})",
-        if takeover { "quill/takeover" } else { "qtfb" },
+        disp.name(),
         surf.w,
         surf.h,
         surf.stride
@@ -122,7 +129,7 @@ fn run() -> std::io::Result<()> {
     let mut pen_dev = match pen::PenDevice::open() {
         Ok(p) => Some(p),
         Err(e) => {
-            eprintln!("riddle: raw pen unavailable ({e}), falling back to qtfb pen events");
+            eprintln!("riddle: raw pen unavailable ({e}), falling back to window pen events");
             None
         }
     };
@@ -143,14 +150,14 @@ fn run() -> std::io::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigterm))?;
 
     // Blank page.
-    surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+    surf.fill_paper_rect(0, 0, SCREEN_W, SCREEN_H);
     disp.update_all(surf.w, surf.h);
 
     // Warm the oracle now: pi loads Node + extensions + codex auth ONCE here,
     // while you're still picking up the pen, so replies pay only model latency.
     let oracle = match oracle::Oracle::spawn() {
         Ok(o) => {
-            eprintln!("riddle: oracle warming (pi rpc)");
+            eprintln!("riddle: oracle ready");
             Some(o)
         }
         Err(e) => {
@@ -169,13 +176,13 @@ fn run() -> std::io::Result<()> {
     let mut stylus_on = false;
     let mut stylus_tapped = false;
     let mut ink_dirty = BBox::empty();
-    // Experiment: while drawing, stamp a tiny faded footprint beside the ink.
-    // This tests mixing precomposed pixel art with live pen updates.
-    let mut last_footstep: Option<(i32, i32)> = None;
-    let mut footstep_i: u32 = 0;
     let mut last_flush = Instant::now();
-    // Takeover swaps are cheap and synchronous; qtfb needs coalescing.
-    let flush_every = if takeover { Duration::from_millis(8) } else { Duration::from_millis(35) };
+    // Takeover and desktop swaps are cheap; qtfb/AppLoad needs coalescing.
+    let flush_every = if takeover || disp.name() == "desktop" {
+        Duration::from_millis(8)
+    } else {
+        Duration::from_millis(35)
+    };
 
     eprintln!("riddle: the diary is open");
 
@@ -250,7 +257,6 @@ fn run() -> std::io::Result<()> {
                     if pen_down {
                         pen_down = false;
                         user_ink.pen_up();
-                        last_footstep = None;
                         if let State::Listening { ref mut last_pen } = state {
                             *last_pen = Some(Instant::now());
                         }
@@ -263,15 +269,7 @@ fn run() -> std::io::Result<()> {
                         let d = match s.tool {
                             pen::Tool::Pen => {
                                 let r = 2 + s.pressure * 3 / pen::MAX_PRESSURE;
-                                let mut d = user_ink.pen_point(&mut surf, s.x, s.y, r);
-                                if should_stamp_footstep(last_footstep, s.x, s.y) {
-                                    let f = draw_faded_footstep(&mut surf, s.x + 52, s.y - 38, footstep_i);
-                                    d.add(f.x0, f.y0, 0);
-                                    d.add(f.x1, f.y1, 0);
-                                    last_footstep = Some((s.x, s.y));
-                                    footstep_i = footstep_i.wrapping_add(1);
-                                }
-                                d
+                                user_ink.pen_point(&mut surf, s.x, s.y, r)
                             }
                             pen::Tool::Eraser => user_ink.erase_point(&mut surf, s.x, s.y, 22),
                         };
@@ -304,15 +302,12 @@ fn run() -> std::io::Result<()> {
                     stylus_tapped = true;
                     if let State::Listening { ref mut last_pen } = state {
                         pen_down = true;
-                        let r = 2 + ev.d.clamp(0, 100) / 45;
-                        let mut d = user_ink.pen_point(&mut surf, ev.x, ev.y, r);
-                        if should_stamp_footstep(last_footstep, ev.x, ev.y) {
-                            let f = draw_faded_footstep(&mut surf, ev.x + 52, ev.y - 38, footstep_i);
-                            d.add(f.x0, f.y0, 0);
-                            d.add(f.x1, f.y1, 0);
-                            last_footstep = Some((ev.x, ev.y));
-                            footstep_i = footstep_i.wrapping_add(1);
-                        }
+                        let d = if ev.d < 0 {
+                            user_ink.erase_point(&mut surf, ev.x, ev.y, 22)
+                        } else {
+                            let r = 2 + ev.d.clamp(0, 100) / 45;
+                            user_ink.pen_point(&mut surf, ev.x, ev.y, r)
+                        };
                         if !d.is_empty() {
                             ink_dirty.add(d.x0, d.y0, 0);
                             ink_dirty.add(d.x1, d.y1, 0);
@@ -327,7 +322,6 @@ fn run() -> std::io::Result<()> {
                     if pen_down {
                         pen_down = false;
                         user_ink.pen_up();
-                        last_footstep = None;
                         if let State::Listening { ref mut last_pen } = state {
                             *last_pen = Some(Instant::now());
                         }
@@ -352,7 +346,7 @@ fn run() -> std::io::Result<()> {
                     if help::looks_like_question_mark(user_ink.stroke_list()) {
                         // Absorb the "?" and open the guide instead of asking.
                         let (qx, qy, qw, qh) = user_ink.bbox.rect();
-                        surf.fill_rect(qx as usize, qy as usize, qw as usize, qh as usize, WHITE);
+                        surf.fill_paper_rect(qx as usize, qy as usize, qw as usize, qh as usize);
                         disp.update(qx, qy, qw, qh, false);
                         user_ink.clear();
                         let panel = help::show(&mut surf, &font);
@@ -387,7 +381,7 @@ fn run() -> std::io::Result<()> {
                     disp.update(x, y, w, h, true);
                     if stage + 1 >= STAGES {
                         user_ink.clear();
-                        State::Thinking { rx, pulse: Instant::now(), blot_on: false }
+                        State::Thinking { rx }
                     } else {
                         State::Drinking { stage: stage + 1, next: Instant::now() + Duration::from_millis(70), region, rx }
                     }
@@ -396,10 +390,8 @@ fn run() -> std::io::Result<()> {
                 }
             }
 
-            State::Thinking { rx, pulse, blot_on } => match rx.try_recv() {
+            State::Thinking { rx } => match rx.try_recv() {
                 Ok(result) => {
-                    surf.fill_rect(SCREEN_W / 2 - 14, SCREEN_H / 2 - 14, 28, 28, WHITE);
-                    disp.update(SCREEN_W as i32 / 2 - 14, SCREEN_H as i32 / 2 - 14, 28, 28, true);
                     // First streamed chunk: start writing now; keep the
                     // receiver so the rest of the reply can append itself.
                     let (text, rx) = match result {
@@ -409,23 +401,10 @@ fn run() -> std::io::Result<()> {
                             ("…".to_string(), None)
                         }
                     };
-                    let plan = plan_reply(&font, &text, None);
+                    let plan = plan_reply(&reply_fonts, &text, None);
                     State::Replying { plan, next: Instant::now(), rx }
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    if pulse.elapsed() >= Duration::from_millis(600) {
-                        let (cx, cy) = (SCREEN_W as i32 / 2, SCREEN_H as i32 / 2);
-                        if blot_on {
-                            surf.fill_rect(cx as usize - 14, cy as usize - 14, 28, 28, WHITE);
-                        } else {
-                            surf.stamp(cx, cy, 9, BLACK);
-                        }
-                        disp.update(cx - 14, cy - 14, 28, 28, true);
-                        State::Thinking { rx, pulse: Instant::now(), blot_on: !blot_on }
-                    } else {
-                        State::Thinking { rx, pulse, blot_on }
-                    }
-                }
+                Err(mpsc::TryRecvError::Empty) => State::Thinking { rx },
                 Err(mpsc::TryRecvError::Disconnected) => State::Listening { last_pen: None },
             },
 
@@ -435,7 +414,7 @@ fn run() -> std::io::Result<()> {
                 if let Some(ref r) = rx {
                     let drop_rx = match r.try_recv() {
                         Ok(Ok(more)) => {
-                            append_reply(&font, &mut plan, &more);
+                            append_reply(&reply_fonts, &mut plan, &more);
                             false
                         }
                         Ok(Err(e)) => {
@@ -539,53 +518,11 @@ fn run() -> std::io::Result<()> {
     Ok(())
 }
 
-fn should_stamp_footstep(last: Option<(i32, i32)>, x: i32, y: i32) -> bool {
-    match last {
-        None => true,
-        Some((lx, ly)) => {
-            let dx = x - lx;
-            let dy = y - ly;
-            dx * dx + dy * dy >= 120 * 120
-        }
-    }
-}
-
-/// Stamp a tiny solid black footprint beside live ink.
-fn draw_faded_footstep(surf: &mut Surface, x: i32, y: i32, i: u32) -> BBox {
-    let side = if i % 2 == 0 { -1 } else { 1 };
-    let tilt = side * 5;
-    let mut bbox = BBox::empty();
-    solid_ellipse(surf, x, y, 8, 12, &mut bbox);
-    solid_ellipse(surf, x + side * 8, y - 15, 5, 7, &mut bbox);
-    solid_ellipse(surf, x + side * 2 + tilt, y - 25, 3, 4, &mut bbox);
-    solid_ellipse(surf, x + side * 9 + tilt, y - 27, 3, 4, &mut bbox);
-    solid_ellipse(surf, x + side * 15 + tilt, y - 23, 2, 3, &mut bbox);
-    bbox
-}
-
-fn solid_ellipse(
-    surf: &mut Surface,
-    cx: i32,
-    cy: i32,
-    rx: i32,
-    ry: i32,
-    bbox: &mut BBox,
-) {
-    for dy in -ry..=ry {
-        for dx in -rx..=rx {
-            if dx * dx * ry * ry + dy * dy * rx * rx <= rx * rx * ry * ry {
-                surf.put_px(cx + dx, cy + dy, BLACK);
-                bbox.add(cx + dx, cy + dy, 1);
-            }
-        }
-    }
-}
-
 /// Lay out reply text and produce screen-space strokes. `y_start` continues a
 /// streamed reply below its previous chunk; None places the first chunk.
-fn plan_reply(font: &FontRef, text: &str, y_start: Option<i32>) -> WritePlan {
+fn plan_reply(fonts: &script::FontStack, text: &str, y_start: Option<i32>) -> WritePlan {
     let max_w = (SCREEN_W as i32 - 2 * MARGIN_X) as f32;
-    let lines = script::wrap(font, text, REPLY_PX, max_w);
+    let lines = script::wrap_stack(fonts, text, REPLY_PX, max_w);
     let line_h = (REPLY_PX * 1.25) as i32;
     let total_h = line_h * lines.len() as i32;
     let mut y = y_start.unwrap_or(((SCREEN_H as i32 - total_h) / 3).max(60));
@@ -598,7 +535,7 @@ fn plan_reply(font: &FontRef, text: &str, y_start: Option<i32>) -> WritePlan {
     };
 
     for line_text in &lines {
-        let mut raster = script::rasterize_line(font, line_text, REPLY_PX);
+        let mut raster = script::rasterize_line_stack(fonts, line_text, REPLY_PX);
         script::thin(&mut raster);
         let line_strokes = script::trace(&raster);
         let x0 = (SCREEN_W as i32 - raster.width as i32) / 2;
@@ -617,8 +554,8 @@ fn plan_reply(font: &FontRef, text: &str, y_start: Option<i32>) -> WritePlan {
 }
 
 /// Splice a streamed continuation chunk into a running write animation.
-fn append_reply(font: &FontRef, plan: &mut WritePlan, more: &str) {
-    let cont = plan_reply(font, more, Some(plan.next_y));
+fn append_reply(fonts: &script::FontStack, plan: &mut WritePlan, more: &str) {
+    let cont = plan_reply(fonts, more, Some(plan.next_y));
     if cont.strokes.is_empty() {
         return;
     }

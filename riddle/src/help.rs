@@ -4,7 +4,7 @@
 
 use crate::fb::{BBox, SCREEN_H, SCREEN_W};
 use crate::script;
-use crate::surface::{Surface, BLACK, WHITE};
+use crate::surface::{Surface, BLACK};
 use ab_glyph::FontRef;
 
 /// Does the committed ink look like a single big "?" (with or without its
@@ -138,7 +138,7 @@ pub fn show(surf: &mut Surface, font: &FontRef) -> Help {
     let py = (SCREEN_H.saturating_sub(ph)) / 2;
 
     let saved = surf.copy_rect(px, py, pw, ph);
-    surf.fill_rect(px, py, pw, ph, WHITE);
+    surf.fill_paper_rect(px, py, pw, ph);
     frame(surf, px, py, pw, ph, 4);
     frame(surf, px + 14, py + 14, pw - 28, ph - 28, 1);
 
@@ -171,7 +171,7 @@ impl Help {
 /// pixels so waking can restore them exactly.
 pub fn show_sleep(surf: &mut Surface, font: &FontRef) -> Vec<u8> {
     let saved = surf.copy_rect(0, 0, SCREEN_W, SCREEN_H);
-    surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+    surf.fill_paper_rect(0, 0, SCREEN_W, SCREEN_H);
     frame(surf, 48, 48, SCREEN_W - 96, SCREEN_H - 96, 4);
     frame(surf, 66, 66, SCREEN_W - 132, SCREEN_H - 132, 1);
     let y = SCREEN_H * 38 / 100;
